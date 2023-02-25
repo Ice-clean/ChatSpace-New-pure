@@ -1,0 +1,123 @@
+package top.iceclean.chatspace.message.service.impl;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import org.springframework.transaction.annotation.Transactional;
+import top.iceclean.chatspace.cache.UserCache;
+import top.iceclean.chatspace.message.mapper.MessageMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import top.iceclean.chatspace.message.service.MessageService;
+import top.iceclean.chatspace.infrastructure.constant.ResponseStatusEnum;
+import top.iceclean.chatspace.infrastructure.dto.MessageDTO;
+import top.iceclean.chatspace.infrastructure.po.Message;
+import top.iceclean.chatspace.infrastructure.pojo.Response;
+import top.iceclean.chatspace.infrastructure.utils.DateUtils;
+import top.iceclean.chatspace.infrastructure.vo.MessageVO;
+import top.iceclean.chatspace.infrastructure.vo.SessionVO;
+import top.iceclean.chatspace.infrastructure.vo.UserVO;
+import top.iceclean.feign.SessionClient;
+import top.iceclean.feign.UserClient;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.stream.Collectors;
+
+/**
+ * @author : Ice'Clean
+ * @date : 2022-05-25
+ */
+@Service
+public class MessageServiceImpl implements MessageService {
+    @Autowired
+    private MessageMapper messageMapper;
+    @Autowired
+    private UserClient userClient;
+    @Autowired
+    private SessionClient sessionClient;
+
+    private final UserCache userCache;
+
+    public MessageServiceImpl(UserCache userCache) {
+        this.userCache = userCache;
+    }
+
+    @Override
+    public Response getChatHistory(int userId, int sessionId, int page) {
+        // 查询指定会话的历史消息
+        List<Message> messageList = messageMapper.selectPage(
+                new Page<>(page, 10),
+                new LambdaQueryWrapper<Message>()
+                        .eq(Message::getSessionId, sessionId)
+                        .orderByDesc(Message::getCreateTime)
+        ).getRecords();
+        // 这里按时间倒序差，但是前端是顺序插，所以还得翻转一下
+        Collections.reverse(messageList);
+        // 将用户在该会话中的最后阅读消息 ID 更新为最新的
+        sessionClient.updateLastMsgId(sessionId, userId);
+
+        // 将历史信息封装成响应对象并返回
+        List<MessageVO> historyList = toListMessageVO(messageList, userId, false);
+        return new Response(ResponseStatusEnum.OK)
+                .addData("historyList", historyList);
+    }
+
+    @Override
+    public MessageVO toMessageVO(Message message, int userId, boolean info) {
+        // 获取会话响应对象（根据是否需要详细信息获取会话响应对象）
+        SessionVO sessionVO = info ? sessionClient.getSessionVO(message.getSessionId(), userId) :
+                sessionClient.getSessionVO(message.getSessionId());
+
+        // 获取发送用户的响应对象，初步构建消息响应对象
+        UserVO userVO = userCache.wrapUser(userClient.getUserById(message.getSenderId()));
+        MessageVO messageVO = new MessageVO(message, sessionVO, userVO, userId == message.getSenderId());
+
+        // 需要详细信息时，将时间格式精简
+        return messageVO.shortTime(false);
+    }
+
+    @Override
+    @Transactional
+    public void saveMessage(MessageDTO messageDTO) {
+        // 先查询出消息所在的会话
+        Integer sessionId = sessionClient.findSessionId(messageDTO.getSessionType().value(), messageDTO.getTargetId());
+        if (sessionId == null) {
+            System.err.println(messageDTO + " 消息对应的会话不存在！");
+            return;
+        }
+        // 将 DTO 对象转化为实体类
+        Message message = new Message(messageDTO, sessionId);
+        // 设置该消息的 ID 和创建时间，消息 ID 为当前会话最大的 ID 自增 1
+        message.setMsgId(getLastMsgId(sessionId) + 1);
+        message.setCreateTime(DateUtils.getDateTime());
+        messageMapper.insert(message);
+    }
+
+    @Override
+    public int getLastMsgId(int sessionId) {
+        // TODO 考虑先从缓存拿
+        Message message = messageMapper.selectOne(new QueryWrapper<Message>()
+                .select("max(msg_id) as msg_id")
+                .eq("session_id", sessionId));
+        if (message == null) {
+            return 0;
+        }
+        return message.getMsgId();
+    }
+
+    /**
+     * 根据消息列表生成响应消息列表
+     * @param messageList 消息列表
+     * @param userId 用户 ID
+     * @param info 是否需要详细信息（消息列表需要）
+     * @return 消息响应实体列表
+     */
+    public List<MessageVO> toListMessageVO(List<Message> messageList, int userId, boolean info) {
+        List<MessageVO> list = new ArrayList<>(messageList.size());
+        messageList.forEach(message -> list.add(toMessageVO(message, userId, info)));
+        return list;
+    }
+}
